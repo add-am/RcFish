@@ -1,5 +1,5 @@
 ---
-title: "Freshwater Fish Script 1 - Sample Site Analysis"
+title: "Freshwater Fish Site Analysis"
 subtitle: "A Healthy Waters Partnership Analysis"
 description: "Script 1 in a series of scripts designed to analyse and score freshwater fish sampled in the Dry Tropics region."
 author: "Adam Shand"
@@ -20,22 +20,44 @@ This script requires multiple core spatial packages, each of which is loaded bel
 #| label: load packages
 
 #use pacman function to load and install (if required) all other packages
-pacman::p_load(tidyverse, glue, here, sf, tmap, janitor, readxl)
+pacman::p_load(dplyr, tidyr, readr, stringr, glue, here, sf, tmap, readxl)
 
-#load in the custom function used to create the read and write folders for the script
-source(here("functions/script_setup.R"))
+#update/load package
+#pak::pak("add-am/RcTools")
+library(RcTools)
 
-#run the function to create the folders and paths
-script_setup()
+#define relevant paths
+data_path <- glue("{here()}/data/")
+output_path <- glue("{here()}/outputs/")
 
-#read in the custom function to clean column names into our specific style
-source(here("functions/name_cleaning.R"))
+#create folders as needed
+dir.create(glue("{output_path}/raw/"), showWarnings = FALSE, recursive = TRUE)
+dir.create(glue("{output_path}/processed/"), showWarnings = FALSE, recursive = TRUE)
 
 ```
 
 # Load Data
 
-Once our work space is set up we then need to bring in data. This is currently all stored in the one master spreadsheet.
+Two datasets are required:
+
+ - The northern three region
+ - The fish dataset
+
+The northern three dataset is built/loaded with the code below.
+
+```{r}
+
+#check if object exists on file
+if (file.exists("data/n3_region.gpkg")){
+  n3_region <- st_read("data/n3_region.gpkg")
+} else {
+  n3_region <- build_n3_region()
+  st_write(n3_region, "data/n3_region.gpkg")
+}
+
+```
+
+Then fish data is pulled from one master spreadsheet.
 
 ```{r}
 #| label: bring in data
@@ -47,14 +69,14 @@ species_type <- read_excel(glue("{data_path}/raw/dt_freshwater_fish_master.xlsx"
 
 #load observation data
 dt_fish_raw <- read_excel(glue("{data_path}/raw/dt_freshwater_fish_master.xlsx"),
-                          sheet = "DESI", na = c("", "NA", "NULL", "null")) |> 
+                          sheet = "Surveys", na = c("", "NA", "NULL", "null")) |> 
   name_cleaning()
 
 ```
 
 # Edit Data
 
-we will then need to edit and manipulate the data as it is not provided in the easiest format to work with in a computer program (human readability was prioritised). Below we will pivot the data longer (move the spp names from column headers to a specific column), and remove all rows in which no observations of the species occurred (this will reduce the size of the table from ~1647 to ~242 rows).
+we will then need to edit and manipulate the data as it is not provided in the easiest format to work with in a computer program (human readability was prioritised). Below we will pivot the data longer (move the spp names from column headers to a specific column), and remove all rows in which no observations of the species occurred.
 
 ```{r}
 #| label: edit data
@@ -64,6 +86,15 @@ dt_fish <- pivot_longer(dt_fish_raw, cols = 16:ncol(dt_fish_raw),
                         names_to = "Species", values_to = "Observations") |> 
   merge(species_type) |> 
   filter(Observations != 0)
+
+#calculate the financial year the data was collected in, then convert into an sf object
+dt_fish <- dt_fish |> 
+  mutate(Fyear = busdater::get_fy(Date)) |> 
+  st_as_sf(coords = c("LongWgs84", "LatWgs84"), crs = "EPSG:4326") |> 
+  st_transform(st_crs(n3_region))
+
+#intersect with the n3 region to get region, basin and sub basin information
+dt_fish <- st_intersection(dt_fish, n3_region)
 
 #we can then put this aside to be used by the visualisation script later. note it goes to the "processed" folder in the main data folder
 write_csv(dt_fish, glue("{data_path}/processed/fish_data.csv"))
@@ -83,7 +114,7 @@ Starting with the Proportion of Indigenous Species Expected (POISE) and Proporti
 
 #calculate some numbers and statistics or different types of fish at each site
 dt_fish_results_site <- dt_fish |> 
-  group_by(Site) |> 
+  group_by(Site, Fyear) |> 
   mutate(SiteTotNumFish = sum(Observations), #The total number of all fish found at each site
          SiteNumUniqIndSpp = sum(Type == "Indigenous"), #Number of different indigenous species found at each site
          SiteTotNumNoIFish = sum(ifelse(Type != "Indigenous", Observations, 0)), #Number of non indigenous fish found at each site
@@ -93,9 +124,21 @@ dt_fish_results_site <- dt_fish |>
          SitePoise = SiteNumUniqIndSpp/PredictedNumberOfIndigenousSpecies) |> 
   ungroup()
 
-#and then do the same thing at a basin level
+#and then do the same thing at the sub basin and basin level
 dt_fish_results_basin <- dt_fish_results_site |> 
-  group_by(Basin) |> 
+  group_by(SubBasinOrSubZone, Fyear) |> 
+  mutate(SubBasinNumUniqIndSpp = n_distinct(Species)) |> 
+  unique() |> 
+  mutate(SubBasinTotNumFish = sum(SiteTotNumFish),
+         SubBasinTotNumNoIFish = sum(SiteTotNumNoIFish),
+         SubBasinTotNumAliFish = sum(SiteTotNumAliFish),
+         SubBasinTotNumTraFish = sum(SiteTotNumTraFish),
+         SubBasinPropTrans = median(PropTrans),
+         SubBasinPropAlien = median(PropAlien),
+         SubBasinPonis = median(SitePonis, na.rm = T),
+         SubBasinPoise = median(SitePoise, na.rm = T)) |> 
+  ungroup() |> 
+  group_by(BasinOrZone, Fyear) |> 
   mutate(BasinNumUniqIndSpp = n_distinct(Species)) |> 
   select(-c(Species, Type, Observations, GenusSpecies, VernacularName)) |> 
   unique() |> 

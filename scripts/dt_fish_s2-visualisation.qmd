@@ -1,0 +1,322 @@
+---
+title: "Freshwater Fish Script 2 - Data Visualisation"
+subtitle: "A Healthy Waters Partnership Analysis"
+description: "Script 2 in a series of scripts designed to analyse and score freshwater fish sampled in the Dry Tropics region."
+author: "Adam Shand"
+format: html
+params:
+  project_crs: "EPSG:7844"
+  target_fyear: 2024
+---
+
+# Introduction
+
+This is a simple script to calculate scores and grades for the freshwater Fish indicator category in the Freshwater environment for the Dry Tropics region. Following this we will then produce a map of sampling locations. 
+
+
+# Script Set Up
+
+This script requires multiple core spatial packages, each of which is loaded below. Key variables and paths are also created.
+
+```{r}
+#| label: load packages
+
+#use pacman function to load and install (if required) all other packages
+pacman::p_load(tidyverse, glue, here, sf, tmap, janitor, readxl, dataaimsr, grid)
+
+if (interactive()) {
+params <- rmarkdown::yaml_front_matter(rstudioapi::getSourceEditorContext()$path)$params
+}
+
+#load in the custom function used to create the read and write folders for the script
+source(here("functions/script_setup.R"))
+
+#run the function to create the folders and paths
+script_setup()
+
+#set project crs
+proj_crs <- params$project_crs
+
+#read in the custom function to clean column names into our specific style
+source(here("functions/name_cleaning.R"))
+
+```
+
+# Load Data
+
+Below we load all the required data.
+
+## Spatial Data
+
+First up we need to load the spatial data.
+
+```{r}
+#| label: load spatial data
+
+#filter for only the dry tropics land component
+dt_land <- n3_region |> 
+  filter(Region == "Dry Tropics", Environment != "Marine") |> 
+  group_by(BasinOrZone, SubBasinOrSubZone) |> 
+  summarise(geom = st_union(geom)) |> 
+  ungroup() |> st_cast() |> st_make_valid()
+
+#filter for only the dry tropics component, and of stream order not 0 or 1
+dt_watercourses <- n3_watercourse |> 
+  filter(Region == "Dry Tropics", !StreamOrder %in% c(0, 1))
+
+#create a point of interest for townsville from the poi dataset
+tsv <- poi |> filter(PlaceName == "Townsville")
+
+```
+
+## Fish Data
+
+Then we can pull in the relevant fish data that was created by the first dt_fish script.
+
+```{r}
+#| label: load fish data
+
+#get the edited fish data
+fish_data <- read_csv(glue("{data_path}/processed/fish_data.csv")) |> 
+  name_cleaning()
+
+#convert to a spatial file
+fish_sites <- fish_data |> 
+  select(Region, Basin, Watercourse, Site, LatWgs84, LongWgs84) |> 
+  unique() |> group_by(Basin) |> 
+  arrange(desc(Basin), Site) |> 
+  mutate(SiteNumber = row_number()) |> 
+  st_as_sf(coords = c(6, 5), crs = proj_crs)
+
+st_write(fish_sites, "fish_sites.gpkg")
+
+#get the edited fish results
+fish_results <- read_csv(glue("{data_path}/processed/fish_results.csv"))
+
+```
+
+# Visualise
+
+We can now create the map and plots.
+
+## Maps
+
+Below we map the sampling locations. 
+
+```{r}
+#| label: create fish maps
+
+#load in custom function to create the water related layers of the map
+source(here("functions/maps_water_layer.R"))
+
+#load in custom function to create the inset map
+source(here("functions/maps_inset_layer.R"))
+
+#create a background of the burdekin region for the inset map
+dt_background <- n3_region |> 
+  filter(Region == "Dry Tropics") |> 
+  group_by(BasinOrZone) |> 
+  summarise(geom = st_union(geom))
+
+#create target vector to loop lover
+target_vect <- unique(dt_land$BasinOrZone)
+
+for (i in 1:length(target_vect)){#each basin
+  
+  #filter sites
+  filtered_sites <- fish_sites |> filter(Basin == target_vect[i])
+  
+  #define focus area for waterways
+  focus_area <- dt_land |> filter(BasinOrZone == target_vect[i]) |> rename("Sub Basin: All" = SubBasinOrSubZone)
+  
+  #create an invisible buffered version of the sites to help position the map
+  buff_sites <- st_buffer(filtered_sites, as.numeric(sprintf("0.%s", i)))
+  
+  #create the base water layer for the specific basin
+  maps_water_layer(stream_order = c(2,9), water_lines = T, water_polygons = T, 
+                   basin_or_zone = target_vect[i], enviro = c("Freshwater", "Estuarine"), fast = T)
+  
+  #create the background layer using the broader dry tropics backdrop
+  maps_inset_layer(supplied_sf_1 = focus_area, supplied_sf_2 = filtered_sites, background = dt_background, aspect = 0.9)
+
+  #create the main map
+  map <- tm_shape(qld) +
+    tm_polygons(fill = "grey80", 
+                col = "black") +
+    tm_shape(buff_sites, is.main = T) +
+    tm_polygons(fill_alpha = 0, 
+                col_alpha = 0) +
+    tm_shape(dt_land) +
+    tm_polygons(fill = "grey90", 
+                col = "black") +
+    tm_shape(focus_area) +
+    tm_polygons(fill = "Sub Basin: All", 
+                fill.scale = tm_scale_categorical(values = "brewer.pastel1"),
+                fill_alpha = 0.5) +
+    water_map +
+    tm_shape(tsv) +
+    tm_symbols(size = 0.3, 
+               fill = "white", 
+               col = "black",
+               lwd = 2, 
+               shape = 23) +
+    tm_text("PlaceName", 
+            size = 0.8,
+            options = opt_tm_text(shadow = T)) +
+    tm_shape(filtered_sites) +
+    tm_symbols(fill = "Site", 
+               fill.scale = tm_scale_categorical(values = "brewer.paired"),
+               fill.legend = tm_legend(show = F)) +
+    tm_text("SiteNumber", 
+            size = 0.8,
+            options = opt_tm_text(shadow = T)) +    
+    tm_layout(legend.bg.color = "white", 
+              legend.position = c("left", "bottom"),
+              asp = 1.1)
+  #save map
+  tmap_save(map, glue("{output_path}/{tolower(target_vect[i])}-fish.png"), 
+            insets_tm = inset_map, insets_vp = inset_viewport)
+
+}
+
+```
+
+which (roughly) looks like this:
+
+```{r}
+#| label: show map
+#| output: true
+
+#show map
+map
+
+```
+
+## Boxplots
+
+Below we make the boxplots for each indicator category in each basin. Using results from all sites within the basin.
+
+### POISE
+
+Because each indicator category is remarkably different in scale, we will do them one at a time. Starting with POISE.
+
+```{r}
+#| label: box plots
+
+#set theme
+theme_set(theme_bw(8))
+
+#get data
+fish_box_data <- fish_results |> 
+  select(Basin, SitePoise, SitePonis) |> 
+  mutate(Basin = fct_reorder(Basin, desc((Basin)))) |> 
+  unique()
+
+#Set up the background data frame by creating the grade, value and basin categorization
+grade <- factor(c("Very Good (>81)", "Good (61 - <81)", "Moderate (41 - <61)", "Poor (21 - <41)", "Very Poor (<21)"),
+                levels = c("Very Good (>81)", "Good (61 - <81)", "Moderate (41 - <61)", "Poor (21 - <41)", "Very Poor (<21)"))
+value <- rev(c(0.40, 0.13, 0.14, 0.13, 0.2))
+basin  <- rep(c("Ross", "Black"), each = length(grade))
+palette <- rep(c("#00B050", "#92D050", "#FFFF00", "#FFC000", "#FF0000"))
+
+#create the actually breaks to put on the y axis
+breaks <- c(0.40, 0.53, 0.67, 0.80, 1)
+
+#build data frame
+df <- data.frame(Basin = basin, Grade = grade, Value = value, Palette = palette)
+
+#create the background
+background <- ggplot() + 
+  geom_bar(data = df, mapping = aes(fill = Grade, y = Value, x = Basin), 
+           position = "stack", stat = "identity", width = 1, alpha = 0.5) + # increase width to fully cover background
+  expand_limits(y = 0) +
+  scale_color_manual(values = palette, name = "Grade") + 
+  scale_fill_manual(values = palette, name = "Grade") +
+  scale_y_continuous(name = "POISE Score", breaks = breaks, expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0, 0))
+
+#create the rest of the plot
+p <- background +
+  geom_violin(data = fish_box_data, mapping = aes(x = Basin, y = SitePoise), 
+              width = 1, fill = "cadetblue3") +
+  geom_boxplot(data = fish_box_data, mapping = aes(x = Basin, y = SitePoise), 
+               width = 0.1,  fill = "grey90", alpha = 0.5) +
+  ggtitle(glue("Proportion of Indigenous Species Expected Standarised Score")) +
+  theme_bw() + theme(panel.grid.major = element_blank(), 
+                     panel.grid.minor = element_blank()) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+#save plot
+ggsave(glue("{output_path}/POISE_boxplot.png"), p, height = 8, width = 7)
+
+```
+
+which looks like this:
+
+```{r}
+#| label: show POISE plot
+#| output: true
+
+p
+
+```
+
+### PONIS
+
+And followed by PONIS.
+
+```{r}
+#| label: create PONIS plot
+
+#Set up the background data frame by creating the grade, value and basin categorization
+grade <- factor(c("Very Poor (<21)", "Poor (21 - <41)", "Moderate (41 - <61)", "Good (61 - <81)", "Very Good (>81)"),
+                levels = c("Very Poor (<21)", "Poor (21 - <41)", "Moderate (41 - <61)", "Good (61 - <81)", "Very Good (>81)"))
+value <- rev(c(0.03, 0.02, 0.05, 0.1, 0.8))
+basin  <- rep(c("Ross", "Black"), each = length(grade))
+palette <- rev(rep(c("#00B050", "#92D050", "#FFFF00", "#FFC000", "#FF0000")))
+
+#create the actually breaks to put on the y axis
+breaks <- c(0.03, 0.05, 0.1, 0.2, 1)
+
+#build data frame
+df <- data.frame(Basin = basin, Grade = grade, Value = value, Palette = palette)
+
+#create the background
+background <- ggplot() + 
+  geom_bar(data = df, mapping = aes(fill = Grade, y = Value, x = Basin), 
+           position = "stack", stat = "identity", width = 1, alpha = 0.5) + # increase width to fully cover background
+  expand_limits(y = 0) +
+  scale_color_manual(values = palette, name = "Grade") + 
+  scale_fill_manual(values = palette, name = "Grade") +
+  scale_y_continuous(name = "PONIS Score", breaks = breaks, expand = c(0, 0)) +
+  scale_x_discrete(expand = c(0, 0))
+
+#create the rest of the plot
+p <- background +
+  geom_violin(data = fish_box_data, mapping = aes(x = Basin, y = SitePonis), 
+              width = 0.8, fill = "cadetblue3") +
+  geom_boxplot(data = fish_box_data, mapping = aes(x = Basin, y = SitePonis), 
+               width = 0.1,  fill = "grey90", alpha = 0.5) +
+  ggtitle(glue("Proportion of Non-Indigenous Species Standarised Score")) +
+  theme_bw() + theme(panel.grid.major = element_blank(), 
+                     panel.grid.minor = element_blank()) +
+  theme(plot.title = element_text(hjust = 0.5))
+
+#save plot
+ggsave(glue("{output_path}/PONIS_boxplot.png"), p, height = 8, width = 7)
+
+```
+
+which looks like this:
+
+```{r}
+#| label: show PONIS plot
+#| output: true
+
+p
+
+```
+
+
+
+

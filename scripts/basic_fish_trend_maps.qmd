@@ -1,0 +1,377 @@
+---
+title: "Basic Fish Maps"
+subtitle: "A Healthy Waters Partnership Analysis"
+description: "This script creates some basic maps explore POISE and PONIS trends."
+author: "Adam Shand"
+format: html
+params:
+  project_crs: "EPSG:7844"
+  target_fyear: 2024
+---
+
+# Introduction
+
+This script creates some basic maps explore POISE and PONIS trends. Specifically it is looking at how POISE and PONIS change at a site level across a spatial distribution. The general trend appears to be worse results around urban centres.
+
+We are also going to create a map that demonstrates the frequency of fish sampling sites in comparison to other types of sampling such as water quality.
+
+Finally, for demonstration purposes I will create one more set of maps of the PONIS and POISE sites with landuse in the background.
+
+# Script Set Up
+
+Only 6 key packages are needed for this short script:
+
+```{r}
+
+#use pacman function to load and install (if required) all other packages
+pacman::p_load(sf, tidyr, dplyr, tmap, here, glue)
+
+#if the script is being run in an interactive environment the params will need to be pulled in
+if (interactive()) {
+params <- rmarkdown::yaml_front_matter(rstudioapi::getSourceEditorContext()$path)$params
+}
+
+#load in the custom function used to create the read and write folders for the script
+source(here("functions/script_setup.R"))
+
+#run the function to create the folders and paths
+script_setup()
+
+#read in the custom function to clean column names into our specific style
+source(here("functions/name_cleaning.R"))
+
+#turn off spherical geometry
+sf_use_s2(F)
+
+```
+
+# Load Data
+
+We are using the n3_regions dataset, which is actually loaded as part of the initial set up. Along with this we are going to load in the full fish sample site and score dataset for the Dry Tropics region, along with a partial dataset of fish sampling sites in the Don Basin. We also load landuse data in from over in the n3 folder.
+
+```{r}
+
+#already loaded, just showing that it is
+n3_region <- n3_region
+
+dt_fish_data <- read_csv(glue("{data_path}/dt_fish_sites_and_scores.csv"))
+
+don_fish_sites <- read_csv(glue("{data_path}/don_sites.csv"))
+
+landuse <- st_read(here("data/02. northern_three/n3_climate_land-use/processed/n3_land_use_clean.gpkg"))
+
+```
+
+# Manipulate Data
+
+There are a few key manipulations that need to occur:
+
+ 1. Sites should only be used if they have been sampled across at least 2 years, thus single year sites need to be removed
+ 2. Sites that have an "NA" run need to be removed
+ 3. The lat and long coordinates for sites need to be turned into a proper geometry object, they also need to be averages as each year they many vary very slightly
+ 4. The POISE and PONIS scores need to be averaged across years to obtain an average
+
+```{r}
+
+#clean and manipulate data
+dt_fish_data_clean <- dt_fish_data |> 
+  filter(!is.na(Run)) |> 
+  group_by(RCArea, Waterway, Location) |> 
+  mutate(Count = n()) |> 
+  filter(Count >= 2) |> 
+  summarise(
+    PropIndigSpp = mean(PropIndigSpp, na.rm = T),
+    PropNonIndigSpp = mean(PropNonIndigSpp, na.rm = T),
+    LatWGS84Fished = mean(LatWGS84Fished, na.rm = T),
+    LongWGS84Fished = mean(LongWGS84Fished, na.rm = T)
+    )
+
+#convert to sf object and update CRS
+dt_fish_sf <- dt_fish_data_clean |> 
+  st_as_sf(
+    coords = c("LongWGS84Fished", "LatWGS84Fished"), 
+    crs = "EPSG:4326") |> 
+  st_transform("EPSG:7844")
+
+```
+
+Next, to ensure that the maps present point sizes scaled correctly, we need to invert the PropNonIndigSpp column. Since the column is scaled from zero to 1 we can just minus the value from 1 for each cell.
+
+Then we will emphasize the size differences a bit more using a log transformation 
+
+```{r}
+
+dt_fish_sf <- dt_fish_sf |> 
+  mutate(
+    ReScaledPropNonIndigSpp = 1 - PropNonIndigSpp,
+    ReScaledPropNonIndigSpp = ReScaledPropNonIndigSpp^2,
+    ReScaledPropIndigSpp = PropIndigSpp^2
+    )
+
+```
+
+Next, we can convert the don dataset into a sf object. At this point we will also create a single water quality sampling point, noting that these coordiates have been roughly estimated from a static map.
+
+```{r}
+
+don_fish_sites_sf <- don_fish_sites |> 
+  group_by(DBSiteCode) |> 
+  summarise(
+    LatWGS84Fished = mean(LatWGS84Fished, na.rm = T),
+    LongWGS84Fished = mean(LongWGS84Fished, na.rm = T)) |> 
+  st_as_sf(
+    coords = c("LongWGS84Fished", "LatWGS84Fished"),
+    crs = "EPSG:4326") |> 
+  st_transform("EPSG:7844") |> 
+  mutate("Site Type" = "Fish") |> 
+  select("Site Type", geometry)
+
+don_wq_sites <- st_as_sf(
+  tibble::tibble(
+    "Site Type" = "Water Quality",
+    geometry = c(st_sfc(st_point(c(148.2041, -20.0024)), crs = 4326)))
+  ) |> 
+  st_transform("EPSG:7844")
+
+#combine tables
+don_sites <- rbind(don_fish_sites_sf, don_wq_sites)
+
+```
+
+Finally we will limit the landuse data down to just the Dry Tropics region.
+
+```{r}
+
+dt_landuse <- landuse |> 
+  filter(
+    Region == "Dry Tropics",
+    Year == "2021") |> 
+  mutate(Primary = case_when(
+    str_detect(Primary, "conservation") ~ "Conservation",
+    str_detect(Primary, "relatively ") ~ "Grazing",
+    str_detect(Primary, "dryland") ~ "Dryland Agriculture",
+    str_detect(Primary, "irrigated ") ~ "Irrigated Agriculture",
+    str_detect(Primary, "intensive") ~ "Urban/Intensive",
+    str_detect(Primary, "water") ~ "Water",
+    T ~ Primary
+  )) |> 
+  st_make_valid()
+
+```
+
+# Create a Simple Map Showing Areas
+
+With the data manipulation completed simple maps can now be created:
+
+```{r}
+
+#load in the helper mapping functions
+source(here("functions/maps_water_layer.R"))
+source(here("functions/maps_inset_layer.R"))
+
+#create a custom (discrete) colour palette (just as a vector)
+colour_vector <- c("#FF0000", "#FFC000", "#FFFF00","#92D050", "#00B050")
+
+#create custom (discrete) breaks for the palette, two different sets of breaks
+custom_breaks <- list(
+  c(0, 0.4, 0.53, 0.67, 0.8, 1),
+  c(0, 0.03, 0.05, 0.1, 0.2, 1)
+)
+
+#create a background of the full DT region for the inset map
+dt_background <- n3_region |> 
+  filter(
+    Region == "Dry Tropics", 
+    Environment != "Marine",
+    !SubBasinOrSubZone %in% c("Palm Islands", "Magnetic Island")) |> 
+  group_by(Region) |> summarise(geom = st_union(geom))
+
+#create a second background that includes the sub basin outlines
+dt_sub_basins <- n3_region |> 
+  filter(
+    Region == "Dry Tropics", 
+    Environment != "Marine",
+    !SubBasinOrSubZone %in% c("Palm Islands", "Magnetic Island")) |>
+  group_by(Region, BasinOrZone, SubBasinOrSubZone) |> 
+  summarise(geom = st_union(geom))
+
+#create the base water layer
+maps_water_layer(stream_order = c(2,9), water_lines = T, water_polygons = T, 
+                 basin_or_zone = c("Ross", "Black"), enviro = c("Freshwater", "Estuarine"), fast = T)
+  
+#create the background layer using the broader dry tropics backdrop
+maps_inset_layer(supplied_sf_1 = dt_background, background = dt_background, aspect = 1, use_bbox_1 = FALSE)
+
+for (i in 1:2){
+
+  #create the map
+  base_map <- tm_shape(qld) +
+    tm_polygons(fill = "grey80") +
+    tm_shape(dt_sub_basins, is.main = T) +
+    tm_polygons(
+      fill = "grey90",
+      col = "black") +
+    water_map +
+    tm_shape(dt_fish_sf) +
+    tm_symbols(
+      size = if (i == 1){"ReScaledPropIndigSpp"} else {"ReScaledPropNonIndigSpp"},
+      size.scale = tm_scale_continuous(values.scale = 1.5),
+      size.legend = tm_legend_hide(),
+      fill = if (i == 1){"PropIndigSpp"} else {"PropNonIndigSpp"},
+      fill.scale = tm_scale_intervals(
+        values = if (i == 1){colour_vector} else {rev(colour_vector)},
+        breaks = custom_breaks[[i]]
+      ),
+      fill.legend = tm_legend(title = if (i == 1){"POISE"} else {"PONIS"})
+    ) +
+    tm_layout(
+      legend.bg.color = "white", 
+      legend.position = c("left", "bottom"),
+      asp = 1)
+
+  #save map to object
+  assign(glue("map_{i}"), base_map)
+}
+
+```
+
+The POISE map looks like this:
+
+```{r}
+
+map_1
+
+```
+
+And the PONIS map looks like this:
+
+```{r}
+
+map_2
+
+```
+
+Next we can create the don map.
+
+```{r}
+
+#create a background of the full MWI region for the inset map
+mwi_background <- n3_region |> 
+  filter(
+    Region == "Mackay Whitsunday Isaac", 
+    Environment != "Marine") |> 
+  group_by(Region) |> summarise(geom = st_union(geom))
+
+#create a second background that is just the Don basin
+don_basin <- n3_region |> 
+  filter(BasinOrZone == "Don") |>
+  group_by(BasinOrZone) |> 
+  summarise(geom = st_union(geom))
+
+#create the base water layer
+maps_water_layer(stream_order = c(2,9), water_lines = T, water_polygons = T, 
+                 basin_or_zone = "Don", enviro = c("Freshwater", "Estuarine"), fast = T)
+  
+#create the background layer using the broader dry tropics backdrop
+maps_inset_layer(supplied_sf_1 = don_basin, background = mwi_background, aspect = 1, use_bbox_1 = FALSE)
+
+#build a basic map
+map_3 <- tm_shape(qld) +
+    tm_polygons(fill = "grey80") +
+    tm_shape(mwi_background) +
+    tm_polygons(
+      fill = "grey90",
+      col = "black") +
+    tm_shape(don_basin, is.main = T) +
+    tm_polygons(
+      fill = "grey90",
+      col = "black") +
+    water_map +
+    tm_shape(don_sites) +
+    tm_symbols(
+      fill = "Site Type") +
+    tm_layout(
+      legend.bg.color = "white", 
+      legend.position = c("left", "bottom"),
+      asp = 1)
+
+```
+
+And finally we can put the land use data into the background of our original POISE and PONIS maps.
+
+```{r}
+
+#create a vector of unique landuse types
+unique_landuse <- unique(dt_landuse$Primary)
+
+#create a vector of colours to match up to it
+unique_cols <- c("#277402", "#FFFFBF", "#948A54", "#D0FF73", "#FF5704", "#4F81BD")
+
+#create the base water layer
+maps_water_layer(stream_order = c(2,9), water_lines = T, water_polygons = T, 
+                 basin_or_zone = c("Ross", "Black"), enviro = c("Freshwater", "Estuarine"), fast = T)
+  
+#create the background layer using the broader dry tropics backdrop
+maps_inset_layer(supplied_sf_1 = dt_background, background = dt_background, aspect = 1, use_bbox_1 = FALSE)
+
+for (i in 4:5){
+
+  #create the map
+  base_map <- tm_shape(qld) +
+    tm_polygons(fill = "grey80") +
+    tm_shape(dt_sub_basins, is.main = T) +
+    tm_polygons(
+      fill = "grey90",
+      col = "black") +
+    tm_shape(dt_landuse) +
+    tm_fill(
+      fill = "Primary",
+      fill.scale = tm_scale_categorical(
+        values = unique_cols,
+        levels = unique_landuse
+      ),
+      fill.legend = tm_legend(title = "Land Use"),
+      fill_alpha = 0.5
+    ) +
+    water_map +
+    tm_shape(dt_fish_sf) +
+    tm_symbols(
+      size = if (i == 4){"ReScaledPropIndigSpp"} else {"ReScaledPropNonIndigSpp"},
+      size.scale = tm_scale_continuous(values.scale = 1.5),
+      size.legend = tm_legend_hide(),
+      fill = if (i == 4){"PropIndigSpp"} else {"PropNonIndigSpp"},
+      fill.scale = tm_scale_intervals(
+        values = if (i == 4){colour_vector} else {rev(colour_vector)},
+        breaks = custom_breaks[[i-3]]
+      ),
+      fill.legend = tm_legend(title = if (i == 4){"POISE"} else {"PONIS"})
+    ) +
+    tm_layout(
+      legend.bg.color = "white", 
+      legend.position = c("left", "bottom"),
+      asp = 1)
+
+  #save map to object
+  assign(glue("map_{i}"), base_map)
+}
+
+```
+
+# Saving Results
+
+Below we save each of the maps.
+
+```{r}
+
+#save the maps
+tmap_save(map_1, glue("{output_path}/POISE by Site.png"), insets_tm = inset_map, insets_vp = inset_viewport)
+tmap_save(map_2, glue("{output_path}/PONIS by Site.png"), insets_tm = inset_map, insets_vp = inset_viewport)
+tmap_save(map_3, glue("{output_path}/Done fish and water quality sites.png"), insets_tm = inset_map, insets_vp = inset_viewport)
+tmap_save(map_4, glue("{output_path}/POISE by Site x landuse.png"), insets_tm = inset_map, insets_vp = inset_viewport)
+tmap_save(map_5, glue("{output_path}/PONIS by Site x landuse.png"), insets_tm = inset_map, insets_vp = inset_viewport)
+
+```
+
+```{r}
+
+```
